@@ -1,0 +1,191 @@
+---
+title: "ESM_Baseline"
+output: html_notebook
+---
+
+## Import Libraries
+
+```{r}
+options(verbose = F)
+library(tidyverse)
+library(forecast)
+library(tseries)
+library(scales)
+library(zoo)
+library(xts)
+library(stringr)
+library(xgboost)
+options(verbose = T)
+```
+
+## Import Data
+
+```{r}
+test.sample = read_csv(file = "D:/DATA/Restaurant_Visitor/sample_submission.csv")
+
+visitors = read_csv(file = "D:/DATA/Restaurant_Visitor/air_visit_data.csv") %>%
+  mutate(visit_date = as.Date(visit_date,format = '%Y-%m-%d'))
+
+id_relate = read_csv(file = "D:/DATA/Restaurant_Visitor/store_id_relation.csv")
+
+air_reserve = read_csv(file = "D:/DATA/Restaurant_Visitor/air_reserve.csv") %>%
+  mutate(visit_date = as.Date(format(visit_datetime,format = '%Y-%m-%d'),format = '%Y-%m-%d')) %>%
+  select(air_store_id,reserve_visitors,visit_date)
+
+hpg_reserve = read_csv(file = "D:/DATA/Restaurant_Visitor/hpg_reserve.csv") %>%
+  mutate(visit_date = as.Date(format(visit_datetime,format = '%Y-%m-%d'),format = '%Y-%m-%d')) %>%
+  inner_join(id_relate, by = 'hpg_store_id') %>%
+  select(air_store_id,reserve_visitors,visit_date)
+
+reserve = bind_rows(air_reserve,hpg_reserve) %>%
+  group_by(air_store_id,visit_date) %>%
+  summarize(reserve_visitors = sum(reserve_visitors)) %>%
+  ungroup() %>%
+  unite(id,air_store_id,visit_date)
+  
+date_info = read_csv(file = "D:/DATA/Restaurant_Visitor/date_info.csv") %>%
+  rename(date = calendar_date)
+
+test.sample = test.sample %>%
+  mutate(date = as.Date(str_sub(id, start = 22),format = "%Y-%m-%d"),
+         air_id = str_sub(id, end = 20))
+
+covered_ids = unique(test.sample$air_id)
+
+covered_dates = as.Date(
+  as.Date('2016-01-01',format = '%Y-%m-%d'):as.Date('2017-04-22',format = '%Y-%m-%d'))
+
+predicted_dates = as.Date(
+  as.Date('2017-04-23',format = '%Y-%m-%d'):as.Date('2017-05-31',format = '%Y-%m-%d')
+)
+```
+
+## Collect Training / Test Data
+
+```{r}
+test = data.frame()
+train = data.frame()
+
+for (store_id in covered_ids){
+  series = filter(visitors,air_store_id == store_id)[,c('visitors','visit_date')]
+  
+  series = series %>% 
+    full_join(data.frame(visit_date = covered_dates),
+              by = 'visit_date') %>%
+    mutate(visitors = if_else(is.na(visitors),0,as.double(visitors))) %>%
+    full_join(data.frame(visit_date = predicted_dates),
+              by = 'visit_date') %>%
+    mutate(id = store_id) %>%
+    arrange(visit_date) %>%
+    left_join(reserve, 
+              by = 'id') %>%
+    rename(date = visit_date) %>%
+    inner_join(date_info, by = 'date')
+
+  first_date = min(which(series[['visitors']] != 0))
+  
+  series = series[first_date:nrow(series),]
+  
+  train_part = filter(series, !is.na(visitors))
+  test_part = filter(series, is.na(visitors))
+  
+  train = bind_rows(train,train_part)
+  test = bind_rows(test,test_part)
+}
+
+rm(list=setdiff(ls(), c("train","test","covered_ids")))
+
+```
+
+##Differences and Lags
+
+```{r}
+test_id = covered_ids[1]
+test_train = filter(train, id)
+
+lags = function(data = NULL, target = NULL){
+  
+}
+
+```
+
+## Objective Functions
+
+```{r}
+
+rmsle_fair_obj <- function(preds, dtrain) {
+  
+  labels <- getinfo(dtrain, "label")
+  preds = log(preds + 1)
+  labels = log(labels + 1)
+  con = 0.7
+  x <- preds - labels
+  grad <- con * x / (abs(x) + con)
+  hess <- con ^ 2 / (abs(x) + con) ^ 2
+  
+  return(list(grad = grad, hess = hess))
+  
+}
+
+#target score - mae of original, non-logged values - user version
+RMSLE = function(true,estimate){
+  
+  RMSLE = sqrt(mean(log(estimate + 1)**2 - log(true + 1)**2))
+  
+  
+  return(RMSLE)
+}
+
+```
+
+## XGB Training/Scoring Function
+
+```{r}
+TRAIN.xgb = function(train.m,train.targ,test.m,obj_function,eval_fun,depth,eta){
+  
+  #special matrices for xgb.train
+  tr.m.xgb = xgb.DMatrix(data = t.m, label=t.loss)
+  va.m.xgb = xgb.DMatrix(data = v.m, label=v.loss)
+  
+  #list of parameters
+  params = list(booster = "gbtree"
+                     , objective = obj_function
+                     , subsample = 0.7
+                     , max_depth = depth
+                     , colsample_bytree = 0.7
+                     , eta = eta
+                     , min_child_weight = 100)
+  
+  #training function, where the magic happens
+  xg_model = xgb.train(params = params,
+                       data = tr.m.xgb,
+                       predictor = 'gpu_predictor',
+                      feval = efun,
+                      nrounds = 10000,
+                      watchlist = list(train = tr.m.xgb, eval = va.m.xgb),
+                      early_stopping_rounds = 150,
+                      print_every_n = 50,
+                      maximize = F,
+                      verbose = T)
+  
+  #return a slew of interesting outputs
+  #mostly predictions and scores
+  return(list(
+    p_train = predict(xg_model,t.m),
+    p_valid = predict(xg_model,v.m)
+    
+    train_MAE = rfun(t.loss,predict(xg_model,t.m)),
+    valid_MAE = rfun(v.loss,predict(xg_model,v.m))
+  ))
+}
+```
+
+## XGBoost Forecasts
+
+```{r}
+store_id = covered_ids[1]
+
+for (store_id in covered_ids){
+  
+}
+```

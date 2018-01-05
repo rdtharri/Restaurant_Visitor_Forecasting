@@ -1,0 +1,133 @@
+---
+title: "ESM_Baseline"
+output: html_notebook
+---
+
+Import Libraries
+
+```{r}
+library(tidyverse)
+library(forecast)
+library(tseries)
+library(scales)
+library(zoo)
+library(xts)
+library(stringr)
+```
+
+Import Data
+
+```{r}
+test.sample = read_csv(file = "D:/DATA/Restaurant_Visitor/sample_submission.csv")
+
+visitors = read_csv(file = "D:/DATA/Restaurant_Visitor/air_visit_data.csv") %>%
+  mutate(visit_date = as.Date(visit_date,format = '%Y-%m-%d'))
+
+id_relate = read_csv(file = "D:/DATA/Restaurant_Visitor/store_id_relation.csv")
+
+air_reserve = read_csv(file = "D:/DATA/Restaurant_Visitor/air_reserve.csv") %>%
+  mutate(visit_date = as.Date(format(visit_datetime,format = '%Y-%m-%d'),format = '%Y-%m-%d')) %>% 
+  select(air_store_id,reserve_visitors,visit_date)
+
+hpg_reserve = read_csv(file = "D:/DATA/Restaurant_Visitor/hpg_reserve.csv") %>%
+  mutate(visit_date = as.Date(format(visit_datetime,format = '%Y-%m-%d'),format = '%Y-%m-%d')) %>% 
+  inner_join(id_relate, by = 'hpg_store_id') %>%
+  select(air_store_id,reserve_visitors,visit_date)
+
+reserve = bind_rows(air_reserve,hpg_reserve) %>%
+  group_by(air_store_id,visit_date) %>%
+  summarize(reserve_visitors = sum(reserve_visitors)) %>%
+  ungroup() %>%
+  unite(id,air_store_id,visit_date)
+  
+```
+
+Data Processing
+
+```{r}
+test.sample = test.sample %>%
+  mutate(date = as.Date(str_sub(id, start = 22),format = "%Y-%m-%d"),
+         air_id = str_sub(id, end = 20))
+
+covered_ids = unique(test.sample$air_id)
+
+covered_dates = as.Date(
+  as.Date('2016-01-01',format = '%Y-%m-%d'):as.Date('2017-04-22',format = '%Y-%m-%d'))
+
+predicted_dates = as.Date(
+  as.Date('2017-04-23',format = '%Y-%m-%d'):as.Date('2017-05-31',format = '%Y-%m-%d')
+)
+```
+
+ESM Baseline
+
+```{r}
+test = data.frame()
+train = data.frame()
+
+store_id = covered_ids[1]
+
+for (store_id in covered_ids){
+  series = filter(visitors,air_store_id == store_id)[,c('visitors','visit_date')]
+  
+  series = series %>% 
+    full_join(data.frame(visit_date = covered_dates),
+              by = 'visit_date') %>%
+    arrange(visit_date) %>%
+    mutate(visitors = if_else(is.na(visitors),0,as.double(visitors)))
+  
+  series = ts(xts(x = series$visitors, 
+                  order.by = series$visit_date, 
+                  frequency = 7),
+              frequency = 7)
+  
+  esm_model = hw(series, h = length(predicted_dates))
+  train_fit = esm_model$fitted
+  predictions = forecast(esm_model)$mean
+  
+  train_frame = data.frame(id = store_id,
+                           date = covered_dates,
+                           visitors = as.double(series),
+                           esm_pred = as.double(train_fit)) %>%
+    mutate(id = paste(id,format(date,format = "%Y-%m-%d"),sep = "_"),
+           esm_pred = if_else(esm_pred < 0,0,as.double(esm_pred))) %>%
+    select(id,visitors,esm_pred)
+  
+  predict_frame = data.frame(id = store_id,
+                             date = predicted_dates,
+                             esm_pred = as.double(predictions)) %>%
+    mutate(id = paste(id,format(date,format = "%Y-%m-%d"),sep = "_"),
+           esm_pred = if_else(esm_pred < 0,0,as.double(esm_pred))) %>%
+    select(id,esm_pred)
+  
+  train = bind_rows(train,train_frame)
+  test = bind_rows(test,predict_frame)
+}
+
+```
+
+Tack on Reserve Values
+
+```{r}
+train = train %>%
+  left_join(reserve, by = 'id') %>%
+  mutate(reserve_visitors = if_else(is.na(reserve_visitors),0,as.double(reserve_visitors)))
+
+test = test %>%
+  left_join(reserve, by = 'id') %>%
+  mutate(reserve_visitors = if_else(is.na(reserve_visitors),0,as.double(reserve_visitors)))
+```
+
+Tack on Date Information
+
+```{r}
+
+train.date = train %>%
+  mutate(date = as.Date(str_sub(id, start = 22),format = "%Y-%m-%d"),
+         air_id = str_sub(id, end = 20))
+
+test.date = test %>%
+  mutate(date = as.Date(str_sub(id, start = 22),format = "%Y-%m-%d"),
+         air_id = str_sub(id, end = 20))
+
+```
